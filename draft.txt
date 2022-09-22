@@ -1,0 +1,6 @@
+so what should the moodle manager exactly do....?
+
+We should have the ability to add multiple managers (a manager for each grade for example...)
+Each manager should have a bunch of user-defined blocks that the manager will check every set time interval
+Each block should have a bunch of quizzes that the manager will check (if they're not solved before a defined dead-line, notify the user)
+Each block should have a formative assessment course which the manager checks
