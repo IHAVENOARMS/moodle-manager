@@ -3,80 +3,139 @@ const MoodleSchedule = require('./scheduleObjects/MoodleSchedule');
 const MoodleAppointment = require('./scheduleObjects/MoodleAppointment');
 const me = require('moodle-user/moodleExceptions');
 const _ = require('underscore');
+const MoodleWeek = require('./scheduleObjects/MoodleWeek');
 
 class MoodleManager {
   constructor(usersToManage) {
     this.users = usersToManage;
+    this.defaultUser = null;
   }
 
   async handleEnrollmentErrorForUser(user, exc) {
     if (!_.isEmpty(exc.enrolmentDetails.enrolFormData)) {
       await user.enrolInCourseWithId(exc.enrolmentDetails.courseId);
-      this.onUnenrolledCourse(user, exc.enrolmentDetails.courseName);
+      this.onFoundUnenrolledCourse(user, exc.enrolmentDetails.courseName);
     } else {
-      this.onUnenrollableCourse(user, exc.enrolmentDetails.courseName);
+      this.onFoundUnenrollableCourse(user, exc.enrolmentDetails.courseName);
     }
   }
 
-  async inspectQuizzArray(quizArray) {
+  async checkUserEnrollmentWithQuiz(user, quizId) {
+    let quiz;
+    try {
+      quiz = await user.visitQuizWithId(quizId);
+    } catch (exc) {
+      if (exc instanceof me.EnrolmentError) {
+        this.handleEnrollmentErrorForUser(user, exc);
+        quiz = await user.visitQuizWithId(quizId);
+      } else throw exc;
+    }
+    return quiz;
+  }
+
+  async inspectQuizWithId(quizId) {
+    this.users.forEach(async (user) => {
+      await user.login();
+      const quiz = await this.checkUserEnrollmentWithQuiz(user, quizId);
+      if (quiz.isEmpty) {
+        this.onFoundEmptyQuiz(user, quiz.course, quiz);
+        return;
+      }
+
+      if (quiz.hasPendingAttempt) {
+        this.onFoundPendingQuiz(user, quiz.course, quiz);
+      }
+
+      if (quiz.wasAttendedBefore) {
+        this.onFoundAttendedQuiz(user, quiz.course, quiz);
+      } else {
+        this.onFoundUnattendedQuiz(user, quiz.course, quiz);
+      }
+      this.onFinishedInspectingQuizz(user);
+    });
+  }
+
+  async inspectQuizzesWithId(quizArray) {
     this.users.forEach(async (user) => {
       await user.login();
       for (let i = 0; i < quizArray.length; i++) {
-        let quiz;
-        try {
-          quiz = await user.visitQuizWithId(quizArray[i]);
-        } catch (exc) {
-          if (exc instanceof me.EnrolmentError) {
-            this.handleEnrollmentErrorForUser(user, exc);
-            quiz = await user.visitQuizWithId(quizArray[i]);
-          }
-        }
-
-        if (quiz.isEmpty) {
-          this.onEmptyQuiz(user, quiz.course, quiz);
-          continue;
-        }
-
-        if (quiz.hasPendingAttempt) {
-          this.onPendingQuiz(user, quiz.course, quiz);
-        }
-
-        if (quiz.wasAttendedBefore) {
-          this.onAttendedQuiz(user, quiz.course, quiz);
-        } else {
-          this.onUnattendedQuiz(user, quiz.course, quiz);
-        }
+        await this.inspectQuizWithId(quizArray[i]);
       }
-      this.onQuizInspectionDone(user);
+      this.onFinishedInspectingQuizzes(user);
     });
   }
 
   async inspectFormAssArray(formAssArray) {
-    const firstUser = this.users[0];
-    await firstUser.login();
+    await this.defaultUser.login();
     for (let i = 0; i < formAssArray.length; i++) {
-      let formativeAssessment;
-      try {
-        formativeAssessment = await firstUser.visitQuizWithId(formAssArray[i]);
-      } catch (exc) {
-        await this.handleEnrollmentErrorForUser(firstUser, exc);
-        formativeAssessment = await firstUser.visitQuizWithId(formAssArray[i]);
-      }
+      const formativeAssessment = await this.checkUserEnrollmentWithQuiz(
+        this.defaultUser,
+        formAssArray[i]
+      );
+
       if (formativeAssessment.isLocked)
-        this.onLockedFormAss(formativeAssessment);
-      else this.onUnlockedFormAss(formativeAssessment);
+        this.onFoundLockedFormAss(formativeAssessment);
+      else this.onFoundUnlockedFormAss(formativeAssessment);
     }
   }
 
-  onUnattendedQuiz = (user, course, quiz) => {};
-  onAttendedQuiz = (user, course, quiz) => {};
-  onEmptyQuiz = (user, course, quiz) => {};
-  onPendingQuiz = (user, course, quiz) => {};
-  onUnenrollableCourse = (user, courseName) => {};
-  onUnenrolledCourse = (user, courseName) => {};
-  onQuizInspectionDone = (user) => {};
-  onUnlockedFormAss = (formAss) => {};
-  onLockedFormAss = (formAss) => {};
+  async solveQuiz(quizId, finishedAttempt) {
+    this.users.forEach(async (user) => {
+      await user.login();
+      const quiz = await this.checkUserEnrollmentWithQuiz(user, quizId);
+      const result = await user.solveQuiz(quiz, finishedAttempt);
+      this.onFinishedSolvingQuiz(user, quiz.course, quiz, result);
+    });
+  }
+
+  async solveQuizFromDefaultUser(quizId) {
+    await this.defaultUser.login();
+    const quiz = await this.checkUserEnrollmentWithQuiz(
+      this.defaultUser,
+      quizId
+    );
+    let finishedAttempt;
+    if (quiz.wasAttendedBefore) {
+      const firstAttempt = quiz.attempts.at(-1);
+      finishedAttempt = await this.defaultUser.reviewAttempt(
+        firstAttempt.id,
+        firstAttempt.cmid
+      );
+      this.onAcquiredSolutionFromUser(this.defaultUser, quiz.course, quiz);
+    } else {
+      finishedAttempt = await this.defaultUser.attendQuiz(quiz);
+      this.onFinishedAttendingQuiz(
+        this.defaultUser,
+        quiz.course,
+        quiz,
+        finishedAttempt
+      );
+    }
+    await this.solveQuiz(quizId, finishedAttempt);
+  }
+
+  async attendQuiz(quizId) {
+    this.users.forEach(async (user) => {
+      await user.login();
+      const quiz = await this.checkUserEnrollmentWithQuiz(user, quizId);
+      const result = await user.attendQuiz(quiz);
+      this.onFinishedAttendingQuiz(user, quiz.course, quiz, result);
+    });
+  }
+
+  onFoundUnattendedQuiz = (user, course, quiz) => {};
+  onFoundAttendedQuiz = (user, course, quiz) => {};
+  onFoundEmptyQuiz = (user, course, quiz) => {};
+  onFoundPendingQuiz = (user, course, quiz) => {};
+  onFinishedAttendingQuiz = (user, course, quiz, result) => {};
+  onFinishedSolvingQuiz = (user, course, quiz, result) => {};
+  onAcquiredSolutionFromUser = (user, course, quiz) => {};
+  onFoundUnenrollableCourse = (user, courseName) => {};
+  onFoundUnenrolledCourse = (user, courseName) => {};
+  onFinishedInspectingQuizz = (user) => {};
+  onFinishedInspectingQuizzes = (user) => {};
+  onFoundUnlockedFormAss = (formAss) => {};
+  onFoundLockedFormAss = (formAss) => {};
 }
 
 const users = [
@@ -88,45 +147,56 @@ const users = [
   new MoodleUser('med2020@8246', 'Gg@12345'),
 ];
 
-// const thirdYearManager = new MoodleManager(users);
-// thirdYearManager.onUnlockedFormAss = (formAss) => {
-//   console.log(
-//     `Formative assessment with name ${formAss.name} in course ${formAss.course.name} is unlocked!`
-//   );
-// };
+const thirdYearManager = new MoodleManager(users);
+thirdYearManager.defaultUser = users[0];
+thirdYearManager.onFoundUnlockedFormAss = (formAss) => {
+  console.log(
+    `Formative assessment with name ${formAss.name} in course ${formAss.course.name} is unlocked!`
+  );
+};
 
-// thirdYearManager.onLockedFormAss = (formAss) => {
-//   console.log(
-//     `Formative assessment with name ${formAss.name} in course ${formAss.course.name} is locked!`
-//   );
-// };
+thirdYearManager.onFoundLockedFormAss = (formAss) => {
+  console.log(
+    `Formative assessment with name ${formAss.name} in course ${formAss.course.name} is locked!`
+  );
+};
 
-// thirdYearManager.onUnattendedQuiz = (user, course, quiz) => {
-//   console.log(`${user.studentName} has not attended ${quiz.name}`);
+thirdYearManager.onFoundUnattendedQuiz = (user, course, quiz) => {
+  console.log(`${user.studentName} has not attended ${quiz.name}`);
+};
 
-// week1.quizzes = [5533, 6400, 6088, 1877];
-// week1.formativeAssessments = [5139, 5322, 6094];
+thirdYearManager.onFoundAttendedQuiz = (user, course, quiz) => {
+  console.log(`${user.studentName} is a good boy! ${quiz.name}`);
+};
 
-// const schedule = new MoodleSchedule([]);
+thirdYearManager.onFinishedSolvingQuiz = (user, course, quiz, result) => {
+  console.log(
+    `Finished solving quiz for ${user.studentName} with a grade of ${result.info.grade}`
+  );
+};
 
-// const checkFormativeAssessments = new MoodleAppointment(
-//   'formativeAssessmentCheckDate',
-//   '*/15 * * * * *',
-//   () => {
-//     thirdYearManager.inspectFormAssArray(week1.formativeAssessments);
-//   }
-// );
+const week1 = new MoodleWeek();
+week1.quizzes = [5533, 6400, 6088, 1877];
+week1.formativeAssessments = [5139, 5322, 6094];
 
-// const checkQuizzes = new MoodleAppointment(
-//   'quizInspectionDate',
-//   '*/1 * * * *',
-//   () => {
-//     thirdYearManager.inspectQuizzArray(week1.quizzes);
-//   }
-// );
+const checkFormativeAssessments = new MoodleAppointment(
+  'formativeAssessmentCheckDate',
+  '*/15 * * * * *',
+  () => {
+    thirdYearManager.inspectFormAssArray(week1.formativeAssessments);
+  }
+);
 
-// schedule.attachAppointment(checkFormativeAssessments);
-// schedule.attachAppointment(checkQuizzes);
+const checkQuizzes = new MoodleAppointment(
+  'quizInspectionDate',
+  '*/1 * * * * *',
+  () => {
+    thirdYearManager.inspectQuizWithId(6400);
+  },
+  1
+);
+
+const schedule = new MoodleSchedule([checkFormativeAssessments, checkQuizzes]);
 
 // const asyncWrapper = async () => {
 //   await users[0].login();
